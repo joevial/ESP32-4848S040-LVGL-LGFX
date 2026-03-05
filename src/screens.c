@@ -7,10 +7,16 @@
 #include "vars.h"
 #include "styles.h"
 #include "ui.h"
+#include <time.h>
 
 #include <string.h>
 
 objects_t objects;
+
+// External variables from monolith.cpp
+extern float windavg, windgust, winddir, temp;
+extern struct tm timeinfo;
+extern bool isSetNtp;
 
 //
 // Event handlers
@@ -23,7 +29,7 @@ lv_obj_t *tick_value_change_obj;
 //
 
 void create_screen_main() {
-    lv_obj_t *obj = lv_obj_create(0);
+    lv_obj_t *obj =  lv_screen_active();
     objects.main = obj;
     lv_obj_set_pos(obj, 0, 0);
     lv_obj_set_size(obj, 480, 480);
@@ -45,10 +51,13 @@ void create_screen_main() {
         }
         {
             lv_obj_t *obj = lv_image_create(parent_obj);
+            objects.obj0 = obj;
             lv_obj_set_pos(obj, -82, 39);
             lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
             lv_image_set_src(obj, &img_windroseimg);
+            add_style_recolor(obj);
             lv_obj_set_style_align(obj, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_image_recolor(obj, lv_color_hex(0xffffffff), LV_PART_MAIN | LV_STATE_DEFAULT);
         }
         {
             // label_avg
@@ -108,14 +117,37 @@ void create_screen_main() {
             lv_obj_set_style_text_color(obj, lv_color_hex(0xfffafafa), LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_align(obj, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_label_set_text(obj, "12:00:00PM");
+            lv_label_set_text(obj, "12:00:00 AM");
         }
     }
     
     tick_screen_main();
 }
 
+// -----------------------------------------------------------------------
+// tick_screen_main - called every lv_timer_handler() tick (~20ms).
+// IMPORTANT: Do NOT call lv_label_set_text_fmt() unconditionally here —
+// every call marks the label dirty and triggers a re-render, which keeps
+// the flush pipeline permanently busy and starves the main loop.
+// Instead, cache previous values and only update when something changed.
+// -----------------------------------------------------------------------
 void tick_screen_main() {
+    static int last_sec = -1;
+    if (objects.label_time != NULL) {
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        if (tm_info != NULL && tm_info->tm_year > 100 && tm_info->tm_sec != last_sec) {
+            last_sec = tm_info->tm_sec;
+            int hour = tm_info->tm_hour;
+            int min  = tm_info->tm_min;
+            int sec  = tm_info->tm_sec;
+            const char *ampm = (hour >= 12) ? "PM" : "AM";
+            if (hour > 12)      hour -= 12;
+            else if (hour == 0) hour  = 12;
+            lv_label_set_text_fmt(objects.label_time, "%d:%02d:%02d %s",
+                                  hour, min, sec, ampm);
+        }
+    }
 }
 
 typedef void (*tick_screen_func_t)();

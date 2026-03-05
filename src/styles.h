@@ -7,6 +7,11 @@
 extern "C" {
 #endif
 
+// Style: recolor
+lv_style_t *get_style_recolor_MAIN_DEFAULT();
+void add_style_recolor(lv_obj_t *obj);
+void remove_style_recolor(lv_obj_t *obj);
+
 #ifdef __cplusplus
 }
 #endif
