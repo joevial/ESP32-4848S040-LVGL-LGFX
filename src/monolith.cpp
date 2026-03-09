@@ -2,7 +2,10 @@
 #include <lvgl.h>
 #include <LovyanGFX.hpp>
 #include <Wire.h>
-#include <TAMC_GT911.h>
+
+#include "BH1750FVI.h"
+#include <MPU9250_WE.h>
+
 #include <esp_sntp.h>
 #include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
 #include <lgfx/v1/platforms/esp32s3/Bus_RGB.hpp>
@@ -18,8 +21,8 @@ extern "C" {
 extern objects_t objects;  // Declared in screens.c
 extern "C" void tick_screen_main();
 char auth[] = "8_-CN2rm4ki9P3i_NkPhxIbCiKd5RXhK";  //hubert
-const char* ssid = "xxx";
-const char* password = "xxx";
+const char* ssid = "mikesnet";
+const char* password = "springchicken";
 
 float windavg, windgust, winddir, temp;
 int hours, mins, secs;
@@ -27,12 +30,78 @@ unsigned long localTimeUnix = 0;
 unsigned long s1LastUpdate = 0;
 struct tm timeinfo;
 bool isSetNtp = false;
+
+// ==================== Sensor I2C Bus (GPIO1=SDA, GPIO40=SCL) ====================
+// Touch uses Wire (I2C_NUM_1, SDA=19, SCL=45) — sensors get their own TwoWire instance
+TwoWire sensorI2C = TwoWire(0);   // I2C_NUM_0
+
+// ==================== Backlight PWM (manual LEDC, bypasses LovyanGFX) ====================
+#define GFX_BL              GPIO_NUM_38
+#define BL_PWM_FREQ         100000    // 100 kHz — above audible range, no coil whine
+#define BL_PWM_RESOLUTION   8
+#define BL_MAX              255
+#define BL_MIN              60            // ~20% duty — below this LEDs don't conduct
+
+// BH1750 — ambient light sensor for automatic backlight control
+BH1750FVI myLux(0x23, &sensorI2C);
+static float    bh1750_lux        = -1.0f;
+static uint8_t  current_brightness = BL_MAX;
+
+
+
+// Touch brightness override — disables auto-brightness for 10 s after any touch
+#define TOUCH_BRIGHTNESS        255
+#define TOUCH_OVERRIDE_MS       10000UL
+static bool     touchOverride      = false;
+static uint32_t touchOverrideStart = 0;
+
+void notifyTouch() {
+    if (!touchOverride && current_brightness != TOUCH_BRIGHTNESS) {
+        ledcWrite(GFX_BL, TOUCH_BRIGHTNESS);
+        current_brightness = TOUCH_BRIGHTNESS;
+        Serial.println("Touch override: brightness -> 128, auto-brightness paused 10s");
+    }
+    touchOverride      = true;
+    touchOverrideStart = millis();  // reset the 10 s window on every touch
+}
+
+
+// MPU-9250 — 9-axis IMU for display orientation detection
+MPU9250_WE mpu(&sensorI2C, 0x68);
+static uint8_t current_rotation    = 0;       // 0/1/2/3 → 0°/90°/180°/270°
+
+// Forward declarations
+void initSensors();
+void updateBrightness();
+void updateOrientation();
+static uint8_t luxToBrightness(float lux);
 void addWindData(float speed, float direction, float gust);
 void drawWindRose();
 void cbSyncTime(struct timeval *tv);
 void initSNTP();
 void setTimezone();
+void applyBootOrientation();
 
+void updateBrightness() {
+    // Expire touch override after 10 s, then resume auto-brightness
+    if (touchOverride && (millis() - touchOverrideStart >= TOUCH_OVERRIDE_MS)) {
+        touchOverride = false;
+        Serial.println("Touch override expired, resuming auto-brightness");
+    }
+    if (touchOverride) return;
+
+    float lux = myLux.getLux();
+    Serial.printf("BH1750 raw lux: %.1f\n", lux);
+    if (lux < 0) return;
+    bh1750_lux = lux;
+
+    uint8_t target = luxToBrightness(lux);
+    if (abs((int)target - (int)current_brightness) > 3) {
+        ledcWrite(GFX_BL, target);
+        Serial.printf("BH1750 %.1f lux → brightness %d → %d\n", lux, current_brightness, target);
+        current_brightness = target;
+    }
+}
 
 
 void cbSyncTime(struct timeval *tv) {
@@ -259,6 +328,10 @@ void drawWindRose() {
     lv_canvas_finish_layer(wind_rose_canvas, &layer);
 }
 
+BLYNK_CONNECTED() {
+  Blynk.syncVirtual(V84, V85, V86, V118);
+}
+
 
 BLYNK_WRITE(V84) {
   windavg = param.asFloat();
@@ -377,6 +450,7 @@ public:
       cfg.pin_sda    = GPIO_NUM_19;
       cfg.pin_scl    = GPIO_NUM_45;
       cfg.pin_rst    = GPIO_NUM_NC;
+      cfg.i2c_addr   = 0x5D;   // GT911 address on this board (INT/RST held high during boot)
 
       cfg.freq       = 400000;
       _touch_instance.config(cfg);
@@ -395,11 +469,6 @@ static uint32_t screenWidth = 480;
 static uint32_t screenHeight = 480;
 
 void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
-    static int flushCount = 0;
-    flushCount++;
-    if (flushCount % 100 == 0) {
-        Serial.printf("flush count=%d\n", flushCount);
-    }
     uint32_t w = (area->x2 - area->x1 + 1);
     uint32_t h = (area->y2 - area->y1 + 1);
     lcd.waitDMA();  // Wait for previous DMA to finish
@@ -407,18 +476,154 @@ void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     lv_disp_flush_ready(disp);  // Safe to call after waitDMA
 }
 
-// ==================== Touch Configuration ====================
-#define TOUCH_GT911_SCL 45
-#define TOUCH_GT911_SDA 19
-#define TOUCH_GT911_INT -1
-#define TOUCH_GT911_RST -1
-
-static TAMC_GT911 ts(TOUCH_GT911_SDA, TOUCH_GT911_SCL, TOUCH_GT911_INT, TOUCH_GT911_RST, 480, 480);
+// ==================== Touch (LovyanGFX built-in GT911) ====================
+// Touch_GT911 is already configured inside the LGFX class (I2C_NUM_1, SDA=19, SCL=45).
+// lcd.getTouch() returns true while a finger is down and fills x/y in screen pixels.
 
 static int32_t touch_x = 0;
 static int32_t touch_y = 0;
 
+void my_touch_read(lv_indev_t *indev, lv_indev_data_t *data) {
+    uint16_t tx = 0, ty = 0;
+    if (lcd.getTouch(&tx, &ty)) {
+        touch_x = tx;
+        touch_y = ty;
+        data->point.x = touch_x;
+        data->point.y = touch_y;
+        data->state    = LV_INDEV_STATE_PRESSED;
+        Serial.printf("Touch: x=%d  y=%d\n", touch_x, touch_y);
+    } else {
+        data->state = LV_INDEV_STATE_RELEASED;
+    }
+}
 
+
+
+// ==================== Sensor Functions ====================
+
+void initSensors() {
+    // Start the dedicated sensor I2C bus on GPIO1 (SDA) and GPIO40 (SCL)
+    sensorI2C.begin(1, 40);
+
+    // --- BH1750 ---
+ myLux.powerOn();
+        Serial.println("BH1750 initialised");
+
+    myLux.setContHigh2Res();
+    // --- MPU-9250 ---
+    if (mpu.init()) {
+        Serial.println("MPU-9250 initialised");
+        // Set gyro offsets manually (tune these from serial output if needed, 
+        // or just use zeros — gyro drift doesn't matter for static orientation)
+        mpu.setGyrOffsets(0.0, 0.0, 0.0);
+        // Do NOT call mpu.autoOffsets() at all
+        mpu.setAccRange(MPU9250_ACC_RANGE_2G);
+        mpu.enableAccDLPF(true);
+        mpu.setAccDLPF(MPU9250_DLPF_6);
+    } else {
+        Serial.println("WARN: MPU-9250 not found — rotation locked at 0°");
+    }
+}
+
+// Map lux → 8-bit backlight PWM (BL_MIN–255).
+static uint8_t luxToBrightness(float lux) {
+    if (lux <= 0.0f)  return BL_MIN;
+    if (lux >= 5.0f)  return BL_MAX;
+    // Logarithmic mapping over 0.0 – 5.0 lux
+    float norm = log10f(lux + 1.0f) / log10f(6.0f);  // 0.0 – 1.0
+    float b    = BL_MIN + norm * (BL_MAX - BL_MIN);
+    return (uint8_t)constrain((int)b, BL_MIN, BL_MAX);
+}
+
+
+
+// ==================== Orientation Detection ====================
+// The SparkFun MPU-9250 is glued flat against the display panel, so the
+// display is always wall-mounted (never truly flat).  Gravity falls along
+// X or Y depending on which edge is down; Z is always perpendicular to the
+// display face and carries very little gravity.
+//
+// getOrientation() enum -> display rotation mapping
+// (tune by reading serial output while holding each edge down):
+//   YX    -> top edge up   -> rotation 0   (normal portrait)
+//   XY_1  -> right edge up -> rotation 1   (landscape CW)
+//   YX_1  -> bottom up     -> rotation 2   (portrait upside-down)
+//   XY    -> left edge up  -> rotation 3   (landscape CCW)
+//   FLAT / FLAT_1 -> display lying flat, keep last rotation
+//
+// If the serial log shows a different enum for a given physical orientation,
+// swap the case values in orientationToRotation() below.
+
+static const char* orientationName(MPU9250_orientation o) {
+    switch (o) {
+        case MPU9250_FLAT:   return "FLAT";
+        case MPU9250_FLAT_1: return "FLAT_1";
+        case MPU9250_XY:     return "XY";
+        case MPU9250_XY_1:   return "XY_1";
+        case MPU9250_YX:     return "YX";
+        case MPU9250_YX_1:   return "YX_1";
+        default:             return "UNKNOWN";
+    }
+}
+
+// Returns 0-3 rotation, or 0xFF if orientation is ambiguous (flat).
+static uint8_t orientationToRotation(MPU9250_orientation o) {
+    switch (o) {
+        case MPU9250_YX:     return 0;    // top up    -> normal
+        case MPU9250_XY_1:   return 3;    // right up  -> 270 CCW
+        case MPU9250_YX_1:   return 2;    // upside-down
+        case MPU9250_XY:     return 1;    // left up   -> 90 CW
+        default:             return 0xFF; // FLAT / FLAT_1 - ignore
+    }
+}
+
+// Apply rotation to lcd + LVGL.  forceApply skips the change-detection
+// guard so it works correctly on first boot.
+static void applyRotation(uint8_t rot, bool forceApply = false) {
+    if (!forceApply && rot == current_rotation) return;
+    current_rotation = rot;
+    Serial.printf("  -> Applying display rotation %d deg\n", rot * 90);
+    lcd.setRotation(rot);
+    uint32_t w = lcd.width();
+    uint32_t h = lcd.height();
+    lv_display_t *disp = lv_display_get_default();
+    if (disp) {
+        lv_display_set_resolution(disp, w, h);
+        lv_obj_invalidate(lv_scr_act());
+    }
+}
+
+// Called every 500 ms from loop() to track live rotation changes.
+void updateOrientation() {
+    MPU9250_orientation orient = mpu.getOrientation();
+    uint8_t new_rotation = orientationToRotation(orient);
+
+    //if (new_rotation != 0xFF)
+   //     Serial.printf("MPU-9250 orientation: %s -> rotation %d deg\n", orientationName(orient), new_rotation * 90);
+   // else
+  //      Serial.printf("MPU-9250 orientation: %s (flat/ambiguous, ignored)\n", orientationName(orient));
+
+    if (new_rotation != 0xFF)
+        applyRotation(new_rotation);
+}
+
+// Called once in setup() after initSensors() and lcd.init() but before ui_init().
+// Reads orientation and immediately rotates the display to match.
+void applyBootOrientation() {
+    delay(50); // let sensor settle after init
+    MPU9250_orientation orient = mpu.getOrientation();
+    uint8_t rot = orientationToRotation(orient);
+    Serial.printf("Boot orientation: %s", orientationName(orient));
+    if (rot == 0xFF) {
+        rot = 0; // display is flat on a desk - default to rotation 0
+        Serial.println(" -> flat, defaulting to 0 deg");
+    } else {
+        Serial.printf(" -> rotation %d deg\n", rot * 90);
+    }
+    applyRotation(rot, true); // force-apply even if rot == current_rotation
+}
+
+bool connected = false;
 
 void setup()
 {
@@ -427,24 +632,9 @@ void setup()
   Serial.println("\n\nStarting LVGL Display with LovyanGFX and GT911 Touch");
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-    WiFi.setTxPower(WIFI_POWER_8_5dBm); //low power for better connectivity
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-  Serial.println("\nWiFi connected");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("RSSI: ");
-  Serial.print(WiFi.RSSI());
-  Serial.println(" dBm");
-  ArduinoOTA.setHostname("monolith");
-    
-    
-  ArduinoOTA.begin();
-  Blynk.config(auth, IPAddress(192, 168, 50, 197), 8080);
-  Blynk.connect();
-  
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); //low power for better connectivity
+
+
   // Allocate wind history
   windHistory = (WindDataPoint *)malloc(windHistoryCapacity * sizeof(WindDataPoint));
   if (windHistory == NULL) {
@@ -463,32 +653,22 @@ void setup()
   }
   
   Serial.println("Initializing display...");
+
   lcd.init();
-  lcd.setBrightness(255);
+  delay(50);
+
+
   
   Serial.println("Display initialized");
-  
-  // Initialize touch
-  Serial.println("Initializing touch...");
-  Wire.begin(TOUCH_GT911_SDA, TOUCH_GT911_SCL);
-  ts.begin();
-  ts.setRotation(0);
-  
-  Serial.println("Touch initialized");
-  
-  // Initialize LVGL
-  Serial.println("Initializing LVGL...");
-  Serial.flush();
+
+  initSensors();
+  applyBootOrientation();
+
   lv_init();
-  Serial.println("DEBUG: lv_init() complete");
-  Serial.flush();
   
-  // Create display for LVGL v9.4 API
-  Serial.println("DEBUG: About to create display...");
-  Serial.flush();
   static lv_display_t *disp = lv_display_create(screenWidth, screenHeight);
-  Serial.println("DEBUG: Display created");
-  Serial.flush();
+
+  
   
   // Allocate draw buffer from PSRAM if available
   static uint8_t *disp_draw_buf = NULL;
@@ -497,104 +677,100 @@ void setup()
   disp_draw_buf = (uint8_t *)heap_caps_malloc(screenWidth * 60 * 2, MALLOC_CAP_SPIRAM);
   if (disp_draw_buf) {
     Serial.println("Allocated display buffer from PSRAM");
-    Serial.flush();
   } else {
     // Fallback to DRAM if PSRAM unavailable (not recommended)
     disp_draw_buf = (uint8_t *)heap_caps_malloc(screenWidth * 60 * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     Serial.println("Allocated display buffer from SRAM (PSRAM unavailable)");
-    Serial.flush();
   }
   
   if (!disp_draw_buf) {
     Serial.println("ERROR: Could not allocate display buffer!");
     while (1) delay(1000);
   }
+
   
-  Serial.println("DEBUG: About to set buffers...");
-  Serial.flush();
   
   // Try PARTIAL mode first to avoid potential hang
   lv_display_set_buffers(disp, disp_draw_buf, NULL, screenWidth * 60 * 2, LV_DISPLAY_RENDER_MODE_PARTIAL);
-  
-  Serial.println("DEBUG: Buffers set");
-  Serial.flush();
-  
-  Serial.println("DEBUG: About to set flush callback...");
-  Serial.flush();
   lv_display_set_flush_cb(disp, my_disp_flush);
-  Serial.println("DEBUG: Flush callback set");
-  Serial.flush();
-  
-  Serial.println("DEBUG: About to set resolution...");
-  Serial.flush();
   lv_display_set_resolution(disp, screenWidth, screenHeight);
-  Serial.println("DEBUG: Resolution set");
-  Serial.flush();
-  
-  Serial.println("DEBUG: About to set as default...");
-  Serial.flush();
   lv_display_set_default(disp);
-  Serial.println("DEBUG: Set as default");
-  Serial.flush();
-  
-  Serial.println("LVGL display configured");
-  Serial.flush();
-  
-  // Create input device
-  Serial.println("DEBUG: About to create input device...");
-  Serial.flush();
-  lv_indev_t *indev = lv_indev_create();
-  Serial.println("DEBUG: Input device created");
-  Serial.flush();
-  
-  Serial.println("DEBUG: About to set input device type...");
-  Serial.flush();
-  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
-  Serial.println("DEBUG: Input device type set");
-  Serial.flush();
-  
-  Serial.println("DEBUG: About to set input device read callback...");
-  Serial.flush();
 
-  Serial.println("DEBUG: Input device read callback set");
-  Serial.flush();
   
-  Serial.println("LVGL input device configured");
-  Serial.flush();
-  
-  // Create UI
-  Serial.println("Creating UI...");
-  Serial.flush();
+  lv_indev_t *indev = lv_indev_create();
+  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+  lv_indev_set_read_cb(indev, my_touch_read);
+
   ui_init();
   Serial.println("UI initialized");
-  Serial.flush();
-  
-  // Force full screen render
-  //lv_obj_invalidate(objects.main);
-  
-  // Run timer handler multiple times to ensure initial render is completed
-  //for (int i = 0; i < 3; i++) {
-  //  lv_timer_handler();
-  //  delay(50);
-  //}
+
   initSNTP();
   Serial.println("Setup complete - Display and touch ready!");
+  ledcAttach(GFX_BL, BL_PWM_FREQ, BL_PWM_RESOLUTION);
+  ledcDetach(GFX_BL);
+  ledcAttach(GFX_BL, BL_PWM_FREQ, BL_PWM_RESOLUTION);
+  ledcWrite(GFX_BL, BL_MAX);
 }
 
 void loop() {
+    if (WiFi.status() != WL_CONNECTED) {
+        if (connected) {
+            Serial.println("WiFi disconnected");
+            connected = false;
+            WiFi.reconnect();
+        }
+    } else {
+        if (!connected) {
+            Serial.println("\nWiFi connected");
+            Serial.print("IP address: ");
+            Serial.println(WiFi.localIP());
+            Serial.print("RSSI: ");
+            Serial.print(WiFi.RSSI());
+            Serial.println(" dBm");
+            Blynk.config(auth, IPAddress(192, 168, 50, 197), 8080);
+            Blynk.connect();
+            ArduinoOTA.setHostname("monolith");
+            ArduinoOTA.begin();
+            connected = true;
+        }
+        else {
+            Blynk.run();
+            ArduinoOTA.handle();
+        }
+    }
+    every(5){
     lv_timer_handler();
     ui_tick();
     lv_refr_now(NULL);
-    ArduinoOTA.handle();
-    Blynk.run();
-    
-    every(500) {
-        drawWindRose();
     }
-    every(60000){
+
+
+    // --- Raw touch diagnostic (remove once touch is confirmed working) ---
+    static bool lastTouched = false;
+    uint16_t tx, ty;
+    bool touched = lcd.getTouch(&tx, &ty);
+    if (touched && !lastTouched) {
+        Serial.printf("RAW touch DOWN: x=%d y=%d\n", tx, ty);
+        notifyTouch();
+    } else if (!touched && lastTouched) {
+        Serial.println("RAW touch UP");
+    }
+    lastTouched = touched;
+    // ---------------------------------------------------------------------
+
+    // Auto-brightness from BH1750
+    every(500) {
+        updateBrightness();
+        updateOrientation();
+    }
+
+
+    every(10000){
     Blynk.syncVirtual(V84);
     Blynk.syncVirtual(V85);
     Blynk.syncVirtual(V86);
     Blynk.syncVirtual(V118);
+        drawWindRose();
     }
+    
 }
