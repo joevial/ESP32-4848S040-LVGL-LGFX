@@ -11,3 +11,5 @@ Then use this to begin on desired GPIOs IE:
 sensorI2C.begin(1, 40);
 
 Backlight control is poor.  It goes through an unidentified SOT-23-6 labelled "GAS" with a triangle/swoosh logo, likely LED driver U5 as identified in 1.png.  I can't get it to work by driving it at anything other than 8bit - 10bit or 12bit and it loops through brightness levels.  Backlight turns off at levels lower than 60/255, so I set 60 as the minimum.  Crappy little LED driver.  Coil whine was eliminated with ledcdetach and a second ledcattach at 100khz - doing it once doesn't take, you have to detach and reattach for it to actually be at 100khz.  then the coil whine is completely gone at any brightness, hooray!
+
+Backlight driver identified as  DIODES™ AP3031.
