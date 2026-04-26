@@ -24,6 +24,7 @@ typedef struct _objects_t {
     lv_obj_t *label1_3;
     lv_obj_t *label1_4;
     lv_obj_t *label_time;
+    lv_obj_t *label_time_1;
 } objects_t;
 
 extern objects_t objects;
