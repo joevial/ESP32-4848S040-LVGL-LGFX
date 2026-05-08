@@ -17,6 +17,13 @@ extern "C" {
 #include <WiFi.h>
 #include <AsyncMqttClient.h>
 #include "time.h"
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <PNGdec.h>
+#ifdef local
+#  undef local   // PNGdec/zutil.h defines "local" as "static"; conflicts with our variable names
+#endif
 // Forward declarations
 void initSensors();
 void updateBrightness();
@@ -33,11 +40,14 @@ void initSNTP();
 void setTimezone();
 void applyBootOrientation();
 float   circularMean(const float* angles, int count);
+// Radar
+void initRadarCanvases();
+void doRadar();
 extern objects_t objects;  // Declared in screens.c
 extern "C" void tick_screen_main();
 const char* ssid = "mikesnet";
 const char* password = "springchicken";
-static bool windRoseDirty = false;
+
 float windavg, windgust, winddir, temp;
 int hours, mins, secs;
 unsigned long localTimeUnix = 0; 
@@ -281,6 +291,32 @@ void updateFade() {
 static bool     touchOverride      = false;
 static uint32_t touchOverrideStart = 0;
 
+// Convert wind direction angle (0-360) to cardinal direction string
+extern "C" const char* angleToCardinal(float angle) {
+    // Normalize angle to 0-360 range
+    while (angle < 0.0f) angle += 360.0f;
+    while (angle >= 360.0f) angle -= 360.0f;
+    
+    // 16-point compass rose
+    if (angle < 11.25f) return "N";
+    if (angle < 33.75f) return "NNE";
+    if (angle < 56.25f) return "NE";
+    if (angle < 78.75f) return "ENE";
+    if (angle < 101.25f) return "E";
+    if (angle < 123.75f) return "ESE";
+    if (angle < 146.25f) return "SE";
+    if (angle < 168.75f) return "SSE";
+    if (angle < 191.25f) return "S";
+    if (angle < 213.75f) return "SSW";
+    if (angle < 236.25f) return "SW";
+    if (angle < 258.75f) return "WSW";
+    if (angle < 281.25f) return "W";
+    if (angle < 303.75f) return "WNW";
+    if (angle < 326.25f) return "NW";
+    if (angle < 348.75f) return "NNW";
+    return "N";
+}
+
 void notifyTouch() {
     if (!touchOverride && current_brightness != 255) {
         fadeBrightness(255, 200);   // quick 200ms fade to full on touch
@@ -288,6 +324,9 @@ void notifyTouch() {
     }
     touchOverride      = true;
     touchOverrideStart = millis();
+    
+    // Switch to menu screen on touch
+    //loadScreen(SCREEN_ID_MENU);
 }
 
 
@@ -357,301 +396,257 @@ void setTimezone() {
 }
 
 
-#define WIND_DIRECTIONS 16
-#define WIND_SPEED_BINS 5
-#define WIND_ROSE_CAPACITY 300           // Reduced to 300 points (~100 averaged points) to prevent watchdog timeout during drawing
-#define ACCUMULATION_BUFFER_SIZE 20     // Accumulate 20 readings before averaging
+#define WIND_DIRECTIONS  16
+#define WIND_SPEED_BINS   5
+#define WIND_MINUTE_MAX 180    // 24 h × 60 min
+ 
 #define every(interval) \
     static uint32_t __every__##interval = millis(); \
     if (millis() - __every__##interval >= interval && (__every__##interval = millis()))
-
-
-struct WindDataPoint {
-    float speed;
-    float gust;
-    float direction;
-    unsigned long timestamp;
+ 
+// One entry per committed minute.  Only 3 bytes of data per slot + 4 bytes ts
+// = 7 bytes × 1440 = ~10 KB, fully static, no heap needed.
+struct MinuteWindPoint {
+    uint8_t  dirBin;   // 0–15  pre-computed direction bucket
+    uint8_t  spdBin;   // 0–4   pre-computed speed bucket
+    uint32_t ts;       // unix timestamp of this minute's start (seconds)
 };
-
-// Wind rose data uses a simple 2D matrix: [direction][speedBin]
-// This is the most efficient storage for quick lookup during drawing
-int tempHistoryCapacity = 0;
-int windHistoryCapacity = 1440;
-int *windRoseData[WIND_DIRECTIONS];  // 2D matrix: [direction (0-15)][speedBin (0-4)]
-WindDataPoint *windHistory = NULL;
-int windHistoryIndex = 0;
-int windHistoryCount = 0;
-bool windRoseUseGust = false;  // If true, use gust for wind rose; otherwise use average speed
-int   windRoseSpeedBins[5] = {5, 10, 15, 20, 0};  // Current speed bins (4 thresholds + padding)
-
-// Accumulate readings before adding to wind rose
-WindDataPoint accumulationBuffer[ACCUMULATION_BUFFER_SIZE];
-int accumulationIndex = 0;
-
-// Calculate circular mean of direction angles
-// Input: array of directions in degrees (0-360)
-// Returns: mean direction in degrees (0-360)
-float circularMeanDirection(float directions[], int count) {
-    if (count == 0) return 0.0f;
-    
-    float sinSum = 0.0f, cosSum = 0.0f;
-    for (int i = 0; i < count; i++) {
-        float radians = directions[i] * M_PI / 180.0f;
-        sinSum += sinf(radians);
-        cosSum += cosf(radians);
-    }
-    
-    float meanRadians = atan2f(sinSum, cosSum);
-    float meanDegrees = meanRadians * 180.0f / M_PI;
-    
-    // Normalize to 0-360
-    if (meanDegrees < 0.0f) meanDegrees += 360.0f;
-    
-    return meanDegrees;
+ 
+static MinuteWindPoint minuteRing[WIND_MINUTE_MAX];
+static int  minuteHead  = 0;   // next write slot (oldest when full)
+static int  minuteCount = 0;   // how many valid entries
+ 
+// Per-minute accumulator — circular components for direction, linear for speed
+static float    accSinSum    = 0.0f;
+static float    accCosSum    = 0.0f;
+static float    accSpeedSum  = 0.0f;
+static float    accGustSum   = 0.0f;
+static int      accCount     = 0;
+static uint32_t accMinute    = 0;         // current minute bucket (unix_ts / 60)
+static uint32_t firstSampleTs = 0;        // unix ts of very first raw sample
+ 
+bool windRoseDirty  = false;
+bool windRoseUseGust = false;   // if true, speed bins use gust average
+ 
+// ── Speed bin helper ─────────────────────────────────────────────────────────
+static int speedToBin(float kph) {
+    if (kph <  5.0f) return 0;
+    if (kph < 10.0f) return 1;
+    if (kph < 15.0f) return 2;
+    if (kph < 20.0f) return 3;
+    return 4;
 }
-
-// Update addWindData function signature and implementation
-
-
+ 
+// ── Flush current accumulator minute into the ring buffer ────────────────────
+// Called automatically when the unix minute changes.  O(1).
+static void flushAccumulatorMinute() {
+    if (accCount == 0) return;
+ 
+    float dir = atan2f(accSinSum, accCosSum) * (180.0f / (float)M_PI);
+    if (dir < 0.0f) dir += 360.0f;
+ 
+    float spd = windRoseUseGust
+                    ? (accGustSum  / accCount)
+                    : (accSpeedSum / accCount);
+ 
+    MinuteWindPoint& slot = minuteRing[minuteHead];
+    slot.dirBin = (uint8_t)((int)((dir + 11.25f) / 22.5f) % WIND_DIRECTIONS);
+    slot.spdBin = (uint8_t)speedToBin(spd);
+    slot.ts     = accMinute * 60;
+ 
+    minuteHead = (minuteHead + 1) % WIND_MINUTE_MAX;
+    if (minuteCount < WIND_MINUTE_MAX) minuteCount++;
+ 
+    windRoseDirty = true;   // signal drawWindRose() that data has changed
+}
+ 
+// ── addWindData ───────────────────────────────────────────────────────────────
+// Called on every MQTT angle message (same signature as before).
+// Accumulates samples within the current unix minute; on minute boundary,
+// commits the circular-mean direction + average speed to the ring buffer.
+// O(1) — no sorting, no heap allocation, no matrix updates here.
 void addWindData(float speed, float direction, float gust) {
-    if (windHistory == nullptr) return;
     if (!isSetNtp) return;
-
-    float adjSpeed = speed;
-    float adjGust  = gust;
-
-    unsigned long now_ts = (unsigned long)time(nullptr);  // ← call ONCE
-
-    windHistory[windHistoryIndex].speed     = adjSpeed;
-    windHistory[windHistoryIndex].gust      = adjGust;
-    windHistory[windHistoryIndex].direction = direction;
-    windHistory[windHistoryIndex].timestamp = now_ts;     // ← reuse
-
-    windHistoryIndex = (windHistoryIndex + 1) % windHistoryCapacity;
-    if (windHistoryCount < windHistoryCapacity) windHistoryCount++;
-
-    accumulationBuffer[accumulationIndex].speed     = adjSpeed;
-    accumulationBuffer[accumulationIndex].gust      = adjGust;
-    accumulationBuffer[accumulationIndex].direction = direction;
-    accumulationBuffer[accumulationIndex].timestamp = now_ts;  // ← reuse
-    accumulationIndex++;
-    // ... rest unchanged
-
-    // When we have 20 readings, calculate circular average and add to wind rose
-    if (accumulationIndex >= ACCUMULATION_BUFFER_SIZE) {
-        // Calculate averages
-        float totalSpeed = 0.0f, totalGust = 0.0f;
-        float directions[ACCUMULATION_BUFFER_SIZE];
-        
-        for (int i = 0; i < ACCUMULATION_BUFFER_SIZE; i++) {
-            totalSpeed += accumulationBuffer[i].speed;
-            totalGust += accumulationBuffer[i].gust;
-            directions[i] = accumulationBuffer[i].direction;
-        }
-        
-        float avgSpeed = totalSpeed / ACCUMULATION_BUFFER_SIZE;
-        float avgGust = totalGust / ACCUMULATION_BUFFER_SIZE;
-        float meanDir = circularMeanDirection(directions, ACCUMULATION_BUFFER_SIZE);
-        
-        // Pre-compute direction and speed bins to avoid recalculation during drawing
-        int dirBin = (int)((meanDir + 11.25f) / 22.5f) % WIND_DIRECTIONS;
-        int spdBin;
-        float speedToUse = (windRoseUseGust) ? avgGust : avgSpeed;
-        if (speedToUse < windRoseSpeedBins[0]) {
-            spdBin = 0;
-        } else if (speedToUse < windRoseSpeedBins[1]) {
-            spdBin = 1;
-        } else if (speedToUse < windRoseSpeedBins[2]) {
-            spdBin = 2;
-        } else if (speedToUse < windRoseSpeedBins[3]) {
-            spdBin = 3;
-        } else {
-            spdBin = 4;
-        }
-        
-        // Add averaged point to wind rose buffer
-        // Increment the matrix directly
-        windRoseData[dirBin][spdBin]++;
-        
-        accumulationIndex = 0;
+ 
+    uint32_t nowTs   = (uint32_t)time(nullptr);
+    uint32_t thisMin = nowTs / 60;
+ 
+    // Track when the very first sample arrived (for sub-minute timestamp)
+    if (firstSampleTs == 0) firstSampleTs = nowTs;
+ 
+    if (accMinute == 0) {
+        accMinute = thisMin;                // first call — latch minute
+    } else if (thisMin != accMinute) {
+        flushAccumulatorMinute();           // minute rolled over — commit
+        accMinute   = thisMin;
+        accSinSum   = 0.0f;
+        accCosSum   = 0.0f;
+        accSpeedSum = 0.0f;
+        accGustSum  = 0.0f;
+        accCount    = 0;
     }
-    windRoseDirty = true;
+ 
+    float rad    = direction * ((float)M_PI / 180.0f);
+    accSinSum   += sinf(rad);
+    accCosSum   += cosf(rad);
+    accSpeedSum += speed;
+    accGustSum  += gust;
+    accCount++;
 }
+ 
 
 
 void drawWindRose() {
-    // Check if any data exists in the matrix
-    int totalCount = 0;
-    for (int dir = 0; dir < WIND_DIRECTIONS; dir++) {
-        for (int spd = 0; spd < WIND_SPEED_BINS; spd++) {
-            totalCount += windRoseData[dir][spd];
-        }
+    if (minuteCount == 0) return;   // nothing committed yet
+    if (!windRoseDirty)  return;    // nothing changed since last draw
+    windRoseDirty = false;
+ 
+    // ── 1. Rebuild the 2D frequency matrix from the ring buffer — O(1440) ──
+    //    Because we rebuild from the ring, old data is automatically excluded
+    //    when the ring wraps past 24 h.  The 2D matrix is just a view, never
+    //    a source of truth.
+    int matrix[WIND_DIRECTIONS][WIND_SPEED_BINS] = {};   // zero-init on stack
+ 
+    int oldest = (minuteCount < WIND_MINUTE_MAX) ? 0 : minuteHead;
+    for (int i = 0; i < minuteCount; i++) {
+        const MinuteWindPoint& p = minuteRing[(oldest + i) % WIND_MINUTE_MAX];
+        matrix[p.dirBin][p.spdBin]++;
     }
-    if (totalCount == 0) {
-        return;
+ 
+    // Direction totals + normalisation max
+    int dirTotals[WIND_DIRECTIONS] = {};
+    int maxTotal = 0;
+    for (int d = 0; d < WIND_DIRECTIONS; d++) {
+        for (int s = 0; s < WIND_SPEED_BINS; s++) dirTotals[d] += matrix[d][s];
+        if (dirTotals[d] > maxTotal) maxTotal = dirTotals[d];
     }
-    
-    // Only redraw every 120 seconds to avoid watchdog timeout and reduce overhead
-    static uint32_t last_draw_ms = 0;
-    uint32_t now = millis();
-    if (now - last_draw_ms < 120000) return;  // Skip if less than 120s since last draw
-    last_draw_ms = now;
-    
-    static lv_obj_t * wind_rose_canvas = NULL;
-    static lv_draw_buf_t draw_buf;
-    static void * canvas_buf = NULL;
-    static bool buf_initialized = false;
-    
-    const int16_t canvasWidth = 275;
-    const int16_t canvasHeight = 275;
-    const int16_t centerX = canvasWidth / 2;
-    const int16_t centerY = canvasHeight / 2;
-    const int16_t maxRadius = 137;
-    int WINDROSECENTER_X = -85;
-    int WINDROSECENTER_Y = 39;
-    int DRAW_CENTER_X = 240 + WINDROSECENTER_X;
-    int DRAW_CENTER_Y = 240 + WINDROSECENTER_Y;
-    lv_color_t speedColors[WIND_SPEED_BINS] = {
-        lv_color_hex(0x00FFFF),
-        lv_color_hex(0x00FF00),
-        lv_color_hex(0xFFFF00),
-        lv_color_hex(0xFF8800),
-        lv_color_hex(0xFF0000)
+    if (maxTotal == 0) return;
+ 
+    // ── 2. Allocate canvas once, reuse forever ──────────────────────────────
+    static lv_obj_t      *canvas     = NULL;
+    static lv_draw_buf_t  draw_buf;
+    static void          *canvas_buf = NULL;
+ 
+    const int16_t CW = 275, CH = 275;
+    const int16_t CX = CW / 2, CY = CH / 2;
+    const float   MAX_R = 137.0f;
+ 
+    const int WINDC_X  = -85, WINDC_Y = 39;
+    const int DRAW_CX  = 240 + WINDC_X;
+    const int DRAW_CY  = 240 + WINDC_Y;
+ 
+    // Speed-bin colours: calm → cyan, light → green, moderate → yellow,
+    //                    fresh → orange, strong → red
+    static const lv_color_t speedColors[WIND_SPEED_BINS] = {
+        lv_color_hex(0x00FFFF),   // < 5 kph
+        lv_color_hex(0x00FF00),   // < 10 kph
+        lv_color_hex(0xFFFF00),   // < 15 kph
+        lv_color_hex(0xFF8800),   // < 20 kph
+        lv_color_hex(0xFF0000),   // ≥ 20 kph
     };
-    
-    if (wind_rose_canvas == NULL) {
-        wind_rose_canvas = lv_canvas_create(objects.main);
-        
-        uint32_t buf_size = canvasWidth * canvasHeight * 4;
-        // Free old buffer if it exists (safety check for reallocation)
-        if (canvas_buf != NULL) {
-            free(canvas_buf);
-            canvas_buf = NULL;
-        }
-        
-        canvas_buf = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (canvas_buf == NULL) {
-            canvas_buf = malloc(buf_size);
-        }
-        
-        if (canvas_buf != NULL) {
-            lv_draw_buf_init(&draw_buf, canvasWidth, canvasHeight, LV_COLOR_FORMAT_ARGB8888, 0, canvas_buf, buf_size);
-            lv_canvas_set_draw_buf(wind_rose_canvas, &draw_buf);
-            lv_obj_set_pos(wind_rose_canvas, (DRAW_CENTER_X + 3) - centerX, DRAW_CENTER_Y - centerY);
-            lv_obj_set_style_bg_opa(wind_rose_canvas, LV_OPA_TRANSP, 0);
-            lv_obj_set_style_border_width(wind_rose_canvas, 0, 0);
-            lv_obj_set_style_pad_all(wind_rose_canvas, 0, 0);
-            buf_initialized = true;
-        } else {
-            Serial.println("WARNING: Failed to allocate canvas buffer - low memory");
+ 
+    if (canvas == NULL) {
+        canvas = lv_canvas_create(objects.main);
+ 
+        uint32_t bufsz = (uint32_t)CW * CH * 4;   // ARGB8888
+        canvas_buf = heap_caps_malloc(bufsz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!canvas_buf) canvas_buf = malloc(bufsz);
+        if (!canvas_buf) {
+            Serial.println("WARN: wind rose canvas alloc failed");
+            canvas = NULL;
             return;
         }
+ 
+        lv_draw_buf_init(&draw_buf, CW, CH, LV_COLOR_FORMAT_ARGB8888,
+                         0, canvas_buf, bufsz);
+        lv_canvas_set_draw_buf(canvas, &draw_buf);
+        lv_obj_set_pos(canvas, (DRAW_CX + 3) - CX, DRAW_CY - CY);
+        lv_obj_set_style_bg_opa(canvas, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(canvas, 0, 0);
+        lv_obj_set_style_pad_all(canvas, 0, 0);
     }
-    
-    if (!buf_initialized) return;
-    
-    lv_canvas_fill_bg(wind_rose_canvas, lv_color_black(), LV_OPA_TRANSP);
-    
-    // Calculate direction totals from the matrix
-    int directionTotals[WIND_DIRECTIONS] = {0};
-    int maxDirectionCount = 0;
-    
-    for (int dir = 0; dir < WIND_DIRECTIONS; dir++) {
-        for (int spd = 0; spd < WIND_SPEED_BINS; spd++) {
-            directionTotals[dir] += windRoseData[dir][spd];
-        }
-        if (directionTotals[dir] > maxDirectionCount) {
-            maxDirectionCount = directionTotals[dir];
-        }
-    }
-    
-    if (maxDirectionCount == 0) return;
-    
+ 
+    // ── 3. Draw — ≤ 80 arc calls total (16 dirs × 5 speed bins) ────────────
+    //    LVGL arc: `radius` is the OUTER edge of the stroke; `width` extends
+    //    inward from there.  So radius = outerR, width = outerR - innerR.
+    //    No inner loop subdividing bands.
+    lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_TRANSP);
+ 
     lv_layer_t layer;
-    lv_canvas_init_layer(wind_rose_canvas, &layer);
-    
-    // Draw each direction bin (speed bins already pre-computed)
-    for (int dir = 0; dir < WIND_DIRECTIONS; dir++) {
-        if (directionTotals[dir] == 0) continue;
-        
-        float spokeLength = (float)directionTotals[dir] / (float)maxDirectionCount * maxRadius;
-        float dirAngle = (dir * (360.0f / WIND_DIRECTIONS)) - 90.0f;
-        float currentRadius = 0;
-        
-        // Draw speed bands for this direction
-        for (int spd = 0; spd < WIND_SPEED_BINS; spd++) {
-            int count = windRoseData[dir][spd];
-            if (count == 0) continue;
-            
-            float bandLength = (float)count / (float)directionTotals[dir] * spokeLength;
-            float innerRadius = currentRadius;
-            float outerRadius = currentRadius + bandLength;
-            
-            int16_t startAngle = (int16_t)(dirAngle - (360.0f / WIND_DIRECTIONS) / 2.0f);
-            int16_t endAngle = (int16_t)(dirAngle + (360.0f / WIND_DIRECTIONS) / 2.0f);
-            
-            while (startAngle < 0) startAngle += 360;
-            while (endAngle < 0) endAngle += 360;
-            
-            int numArcs = (int)(bandLength / 3) + 1;  // Reduced from bandLength/2 for fewer arcs
-            if (numArcs < 1) numArcs = 1;
-            
-            for (int a = 0; a < numArcs; a++) {
-                float radius = innerRadius + (bandLength * a / numArcs) + (bandLength / numArcs / 2);
-                int arcWidth = (int)(bandLength / numArcs) + 2;  // Increased width by 1 to compensate for fewer draws
-                if (arcWidth < 2) arcWidth = 2;
-                
-                lv_draw_arc_dsc_t arc_dsc;
-                lv_draw_arc_dsc_init(&arc_dsc);
-                arc_dsc.color = speedColors[spd];
-                arc_dsc.width = arcWidth;
-                arc_dsc.opa = LV_OPA_COVER;
-                arc_dsc.rounded = 0;
-                arc_dsc.center.x = centerX;
-                arc_dsc.center.y = centerY;
-                arc_dsc.start_angle = startAngle;
-                arc_dsc.end_angle = endAngle;
-                arc_dsc.radius = (int16_t)radius;
-                
-                lv_draw_arc(&layer, &arc_dsc);
-            }
-            
-            currentRadius = outerRadius;
+    lv_canvas_init_layer(canvas, &layer);
+ 
+    for (int d = 0; d < WIND_DIRECTIONS; d++) {
+        if (dirTotals[d] == 0) continue;
+ 
+        float spokeLen = (float)dirTotals[d] / (float)maxTotal * MAX_R;
+        float dirAngle = (float)d * (360.0f / WIND_DIRECTIONS) - 90.0f;
+ 
+        // Arc spans ±11.25° around the spoke centre (= one 22.5° slice)
+        int16_t startAngle = (int16_t)(dirAngle - 11.25f);
+        int16_t endAngle   = (int16_t)(dirAngle + 11.25f);
+        while (startAngle < 0) startAngle += 360;
+        while (endAngle   < 0) endAngle   += 360;
+ 
+        float currentR = 0.0f;
+        for (int s = 0; s < WIND_SPEED_BINS; s++) {
+            if (matrix[d][s] == 0) continue;
+ 
+            float bandLen = (float)matrix[d][s] / (float)dirTotals[d] * spokeLen;
+            float outerR  = currentR + bandLen;
+            int   arcW    = (int)(bandLen) + 1;   // +1 closes pixel gaps between bands
+            if (arcW < 2) arcW = 2;
+ 
+            lv_draw_arc_dsc_t arc;
+            lv_draw_arc_dsc_init(&arc);
+            arc.color       = speedColors[s];
+            arc.width       = (uint16_t)arcW;    // LVGL strokes INWARD from radius
+            arc.opa         = LV_OPA_COVER;
+            arc.rounded     = 0;
+            arc.center.x    = CX;
+            arc.center.y    = CY;
+            arc.radius      = (uint16_t)(outerR + 0.5f);  // outer edge of this band
+            arc.start_angle = startAngle;
+            arc.end_angle   = endAngle;
+ 
+            lv_draw_arc(&layer, &arc);
+            currentR = outerR;
         }
     }
-    
-    lv_canvas_finish_layer(wind_rose_canvas, &layer);
+ 
+    lv_canvas_finish_layer(canvas, &layer);
 }
 
-// ── updateWindTimestamp: Update label_time_1 with time span of wind rose data ──
-// Shows the total time span from oldest to newest wind history entry
-// Formats as: "Xs" for <60s, "Xm" for <60m, "Xh" for >=60m
+
+// Shows how much data has accumulated:
+//   - No data yet                         →  "--"
+//   - < 1 committed minute (sub-minute)   →  "Xs"   (seconds since first sample)
+//   - ≥ 1 committed minute                →  "Xm" or "X.Xh"
+//                                             (oldest ring entry → now)
+//
+// This naturally bootstraps from "5s" on first boot through "24hrs" once full.
 void updateWindTimestamp() {
-    if (windHistoryCount == 0) {
-        lv_label_set_text(objects.label_time_1, "--");
+    uint32_t nowTs = (uint32_t)time(nullptr);
+ 
+    if (minuteCount == 0) {
+        // No committed minute yet — show sub-minute accumulation time
+        if (firstSampleTs == 0 || nowTs <= firstSampleTs) {
+            lv_label_set_text(objects.label_time_1, "--");
+        } else {
+            uint32_t secs = nowTs - firstSampleTs;
+            lv_label_set_text_fmt(objects.label_time_1, "%us", secs);
+        }
         return;
     }
-
-    // Circular buffer: oldest entry is at windHistoryIndex when full,
-    // or at 0 when not yet wrapped. Newest is always one behind windHistoryIndex.
-    int oldestIdx = (windHistoryCount < windHistoryCapacity) ? 0 
-                    : windHistoryIndex;
-    int newestIdx = (windHistoryIndex - 1 + windHistoryCapacity) % windHistoryCapacity;
-
-    unsigned long oldestTimestamp = windHistory[oldestIdx].timestamp;
-    unsigned long newestTimestamp = windHistory[newestIdx].timestamp;
-
-    if (oldestTimestamp == 0 || newestTimestamp == 0 || oldestTimestamp == newestTimestamp) {
-        lv_label_set_text(objects.label_time_1, "--");
-        return;
-    }
-
-    unsigned long spanSecs = newestTimestamp - oldestTimestamp;
-
+ 
+    // Oldest committed minute in the ring
+    int      oldest   = (minuteCount < WIND_MINUTE_MAX) ? 0 : minuteHead;
+    uint32_t oldestTs = minuteRing[oldest].ts;
+    uint32_t spanSecs = (nowTs > oldestTs) ? (nowTs - oldestTs) : 0;
+ 
     if (spanSecs < 60) {
-        lv_label_set_text_fmt(objects.label_time_1, "%lus", spanSecs);
+        lv_label_set_text_fmt(objects.label_time_1, "%us", spanSecs);
     } else if (spanSecs < 3600) {
-        lv_label_set_text_fmt(objects.label_time_1, "%lum", spanSecs / 60);
+        lv_label_set_text_fmt(objects.label_time_1, "%um", spanSecs / 60);
     } else {
         lv_label_set_text_fmt(objects.label_time_1, "%.1fh", spanSecs / 3600.0f);
     }
@@ -920,6 +915,433 @@ void applyBootOrientation() {
     applyRotation(rot, true); // force-apply even if rot == current_rotation
 }
 
+// =====================================================================
+// WEATHER RADAR  (tile.openstreetmap.org + tilecache.rainviewer.com)
+//
+// Requires these libraries (Arduino Library Manager):
+//   • PNGdec  by Larry Bank (bitbank2)
+//   • ArduinoJson
+// LV_USE_PNG is NOT required – all PNG decoding is done via PNGdec.
+//
+// Memory: 4 canvas pixel buffers × 256 KB = 1 MB PSRAM.
+// Tile layout inside radar_cont (512 × 512):
+//   [0] (0,  0 ) → z,  radarX,   radarY
+//   [1] (256,0 ) → z,  radarX+1, radarY
+//   [2] (0,  256) → z, radarX,   radarY+1
+//   [3] (256,256) → z, radarX+1, radarY+1
+// =====================================================================
+
+// ---- tile state (top-left tile of 2×2 grid) ----
+static int   radarZ = 7, radarX = 34, radarY = 46;
+static uint32_t      radarLastFetch   = 0;
+static unsigned long radarTimestamp   = 0;   // unix ts of latest radar frame
+
+// ---- cross-file flags (extern'd in screens.c) ----
+bool radarForceRefresh = true;
+bool radarScreenActive = false;
+
+// ---- LVGL canvas objects (4 tiles, 256×256 ARGB8888 each) ----
+static lv_obj_t*     radarCanvas[4]   = {};
+static lv_draw_buf_t radarDrawBuf[4];
+static uint32_t*     radarPixBuf[4]   = {};   // PSRAM; 256 KB each
+static lv_obj_t*     radarDot         = nullptr;
+static bool          radarReady       = false;
+
+// ---- PNGdec globals (decoder uses a single-call callback model) ----
+static PNG       pngDec;
+static uint32_t* gDecBuf     = nullptr;   // destination pixel buffer for current decode
+static bool      gDecOverlay = false;     // true → alpha-composite; false → opaque write
+
+// One scanline at a time from PNGdec.
+static int pngRow(PNGDRAW* pDraw) {
+    if (!gDecBuf || pDraw->y >= 256 || pDraw->iWidth > 256) return 1;
+    uint32_t* dest = gDecBuf + (uint32_t)pDraw->y * 256;
+
+    if (gDecOverlay && pDraw->iHasAlpha && pDraw->iPixelType == 6) {
+        // ---- Radar overlay: RGBA truecolor, 4 bytes/pixel (R,G,B,A) ----
+        // Alpha-composite ("src over") onto the map pixels already in the buffer.
+        const uint8_t* s = (const uint8_t*)pDraw->pPixels;
+        for (int x = 0; x < pDraw->iWidth; x++, s += 4) {
+            uint8_t a = s[3];
+            if (a == 0) continue;               // fully transparent → keep map pixel
+            uint8_t r = s[0], g = s[1], b = s[2];
+            if (a < 255) {
+                uint32_t bg = dest[x];
+                uint8_t bgR = (bg >> 16) & 0xFF;
+                uint8_t bgG = (bg >>  8) & 0xFF;
+                uint8_t bgB =  bg        & 0xFF;
+                r = (uint8_t)(((uint16_t)r * a + (uint16_t)bgR * (255u - a)) >> 8);
+                g = (uint8_t)(((uint16_t)g * a + (uint16_t)bgG * (255u - a)) >> 8);
+                b = (uint8_t)(((uint16_t)b * a + (uint16_t)bgB * (255u - a)) >> 8);
+            }
+            // LVGL ARGB8888 on LE: uint32 = (A<<24)|(R<<16)|(G<<8)|B
+            dest[x] = (0xFFu << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+        }
+    } else {
+        // ---- Map tile: RGB or palette source → convert via RGB565 helper ----
+        uint16_t line[256];
+        pngDec.getLineAsRGB565(pDraw, line, PNG_RGB565_LITTLE_ENDIAN, 0);
+        for (int x = 0; x < pDraw->iWidth; x++) {
+            uint16_t p = line[x];
+            // Expand 5/6/5 → 8/8/8 with bit-replication for full range
+            uint8_t r = ((p >> 11) & 0x1F); r = (r << 3) | (r >> 2);
+            uint8_t g = ((p >>  5) & 0x3F); g = (g << 2) | (g >> 4);
+            uint8_t b = ( p        & 0x1F); b = (b << 3) | (b >> 2);
+            dest[x] = (0xFFu << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+        }
+    }
+    return 1;
+}
+
+// Allocate 4 LVGL canvas widgets inside radar_cont and move UI chrome to front.
+// Must be called after create_screens() so objects.radar_cont already exists.
+void initRadarCanvases() {
+    if (radarReady) return;
+    const size_t TILE_BYTES = 256u * 256u * 4u;   // 256 KB per tile → 1 MB total
+
+    for (int i = 0; i < 4; i++) {
+        radarPixBuf[i] = (uint32_t*)heap_caps_malloc(
+                            TILE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!radarPixBuf[i]) {
+            Serial.printf("RADAR: PSRAM alloc failed for canvas %d\n", i);
+            return;
+        }
+        memset(radarPixBuf[i], 0x00, TILE_BYTES);   // transparent black until first fetch
+
+        radarCanvas[i] = lv_canvas_create(objects.radar_cont);
+        int cx = (i & 1) ? 256 : 0;
+        int cy = (i & 2) ? 256 : 0;
+        lv_obj_set_pos(radarCanvas[i], cx, cy);
+        lv_obj_set_style_pad_all(radarCanvas[i], 0, 0);
+        lv_obj_set_style_border_width(radarCanvas[i], 0, 0);
+        lv_obj_set_style_bg_opa(radarCanvas[i], LV_OPA_TRANSP, 0);
+
+        lv_draw_buf_init(&radarDrawBuf[i], 256, 256, LV_COLOR_FORMAT_ARGB8888,
+                         0, radarPixBuf[i], TILE_BYTES);
+        lv_canvas_set_draw_buf(radarCanvas[i], &radarDrawBuf[i]);
+    }
+
+    // Location marker: 8×8 red circle with white outline
+    radarDot = lv_obj_create(objects.radar_cont);
+    lv_obj_set_size(radarDot, 8, 8);
+    lv_obj_set_style_radius(radarDot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(radarDot, lv_color_hex(0xFF2020), 0);
+    lv_obj_set_style_bg_opa(radarDot, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(radarDot, 1, 0);
+    lv_obj_set_style_border_color(radarDot, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_pad_all(radarDot, 0, 0);
+    lv_obj_add_flag(radarDot, LV_OBJ_FLAG_HIDDEN);
+
+    // Keep EXIT button and info labels rendered above the map canvases
+    lv_obj_move_foreground(objects.obj1);
+    lv_obj_move_foreground(objects.label_timestamp);
+    lv_obj_move_foreground(objects.label_coords);
+
+    radarReady = true;
+    Serial.printf("RADAR: ready – 4×256KB canvas in PSRAM (%u KB free)\n",
+                  heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+}
+
+// Show a full-screen error message directly via LovyanGFX (bypasses LVGL),
+// then hold for 2 s so the user can read it before LVGL repaints.
+static void radarError(const char* msg) {
+    Serial.printf("RADAR ERROR: %s\n", msg);
+    lcd.fillRect(0, 160, screenWidth, 160, TFT_BLACK);
+    lcd.setTextColor(TFT_RED, TFT_BLACK);
+    lcd.setTextSize(3);
+    lcd.setTextDatum(MC_DATUM);
+    lcd.drawString(msg, screenWidth / 2, 240);
+    lcd.setTextDatum(TL_DATUM);   // restore default
+    delay(2000);
+}
+
+// Download a URL into a fresh PSRAM buffer.  Retries up to 3 times on failure.
+// Returns nullptr on all failures; caller must heap_caps_free() the result.
+static uint8_t* fetchTile(WiFiClientSecure& sc, const String& url, int& outLen) {
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        HTTPClient http;
+        http.begin(sc, url);
+        http.setTimeout(12000);
+        http.addHeader("User-Agent", "ESP32-Weather/1.0");
+        int code = http.GET();
+        if (code != HTTP_CODE_OK) {
+            http.end();
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Tile HTTP %d (try %d/3)", code, attempt);
+            radarError(msg);
+            delay(500);
+            continue;
+        }
+        int len = http.getSize();
+        if (len <= 0 || len > 256 * 1024) {
+            http.end();
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Bad length %d (try %d/3)", len, attempt);
+            radarError(msg);
+            delay(500);
+            continue;
+        }
+        uint8_t* buf = (uint8_t*)heap_caps_malloc(len,
+                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!buf) {
+            http.end();
+            radarError("PSRAM alloc failed");
+            outLen = 0; return nullptr;   // no point retrying an OOM
+        }
+        WiFiClient* stream = http.getStreamPtr();
+        int got = 0;
+        uint32_t t0 = millis();
+        while (got < len && millis() - t0 < 12000) {
+            int avail = stream->available();
+            if (avail > 0) got += stream->readBytes(buf + got,
+                                  (int)min((uint32_t)avail, (uint32_t)(len - got)));
+            else delay(1);
+        }
+        http.end();
+        if (got != len) {
+            heap_caps_free(buf);
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Short read %d/%d (try %d/3)", got, len, attempt);
+            radarError(msg);
+            delay(500);
+            continue;
+        }
+        outLen = len;
+        return buf;
+    }
+    outLen = 0; return nullptr;
+}
+
+// Query the RainViewer API for the most recent radar frame path.
+// Retries up to 3 times on failure.
+static String fetchRadarPath() {
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        HTTPClient http;
+        http.begin("https://api.rainviewer.com/public/weather-maps.json");
+        http.setTimeout(8000);
+        int code = http.GET();
+        if (code != HTTP_CODE_OK) {
+            http.end();
+            char msg[64];
+            snprintf(msg, sizeof(msg), "API HTTP %d (try %d/3)", code, attempt);
+            radarError(msg);
+            delay(500);
+            continue;
+        }
+        String json = http.getString();
+        http.end();
+
+        JsonDocument doc;
+        if (deserializeJson(doc, json) != DeserializationError::Ok) {
+            radarError("JSON parse failed");
+            delay(500);
+            continue;
+        }
+        JsonArray past = doc["radar"]["past"];
+        if (past.size() == 0) {
+            radarError("No radar data");
+            delay(500);
+            continue;
+        }
+        JsonObject latest = past[past.size() - 1];
+        radarTimestamp = latest["time"].as<unsigned long>();
+        return latest["path"].as<String>();
+    }
+    return "";
+}
+
+// Decode one PNG buffer into the pixel buffer for canvas slot `idx`.
+// isOverlay=false → opaque write (map base).
+// isOverlay=true  → alpha-composite over existing pixels (radar layer).
+static void decodeIntoCanvas(uint8_t* data, int len, int idx, bool isOverlay) {
+    gDecBuf     = radarPixBuf[idx];
+    gDecOverlay = isOverlay;
+    if (pngDec.openRAM(data, len, pngRow) == PNG_SUCCESS) {
+        pngDec.decode(nullptr, 0);
+        pngDec.close();
+    } else {
+        Serial.printf("RADAR: PNG open failed for slot %d\n", idx);
+    }
+}
+
+// Main radar refresh.  Fetches 4 map tiles + 4 radar overlays, decodes them
+// into the canvas pixel buffers, then invalidates the canvases so LVGL redraws.
+// Blocking (several seconds) – called from loop() only when on the radar screen.
+void doRadar() {
+    if (!radarReady)          return;
+    if (!WiFi.isConnected())  return;
+    if (!radarForceRefresh && millis() - radarLastFetch < 300000UL) return;
+
+    // Yield to LVGL *before* we block on network I/O so that button pressed
+    // states (and any other pending redraws) are flushed to the display first.
+    // Without this, the user sees no visual feedback until the download finishes.
+    lv_timer_handler();
+    delay(30);   // allow DMA display transfer to complete
+    lv_timer_handler();
+
+    radarLastFetch    = millis();
+    radarForceRefresh = false;
+
+    int z = radarZ, x = radarX, y = radarY;
+    int maxTile = (1 << z) - 1;
+
+    // Four tile coordinates: [0]=(x,y) [1]=(x+1,y) [2]=(x,y+1) [3]=(x+1,y+1)
+    int tx[4] = { x,     x + 1, x,     x + 1 };
+    int ty[4] = { y,     y,     y + 1, y + 1 };
+    for (int i = 0; i < 4; i++) {
+        tx[i] = constrain(tx[i], 0, maxTile);
+        ty[i] = constrain(ty[i], 0, maxTile);
+    }
+
+    // Helper: draw (or erase) the progress bar directly via LovyanGFX,
+    // bypassing LVGL entirely so it appears immediately on screen.
+    // pct 0..100; colour 0 = erase (black).
+    auto radarProgress = [&](int pct, uint32_t colour) {
+        int barW = (screenWidth * pct) / 100;
+        // Erase full bar row first, then fill to barW
+        lcd.fillRect(0, 470, screenWidth, 10, 0x000000u);
+        if (barW > 0 && colour != 0) {
+            lcd.fillRect(0, 470, barW, 10, colour);
+        }
+    };
+
+    // ---- Step 1: latest radar path (RainViewer API) ----
+    String radarPath = fetchRadarPath();
+    if (radarPath.isEmpty()) {
+        lv_label_set_text(objects.label_timestamp, "Radar: API error");
+        radarProgress(0, 0);
+        return;
+    }
+    radarProgress(20, 0x00AA00u);   // 20% — got radar path
+
+    // Single reusable SSL client for all 8 tile fetches
+    WiFiClientSecure sc;
+    sc.setInsecure();
+
+    // ---- Steps 2+3: for each quadrant, download map then blend radar ----
+    for (int i = 0; i < 4; i++) {
+        // Map tile (OpenStreetMap)
+        String mapUrl = String("https://tile.openstreetmap.org/")
+                      + z + "/" + tx[i] + "/" + ty[i] + ".png";
+        int mapLen = 0;
+        uint8_t* mapBuf = fetchTile(sc, mapUrl, mapLen);
+        if (mapBuf) {
+            decodeIntoCanvas(mapBuf, mapLen, i, false);
+            heap_caps_free(mapBuf);
+        }
+        delay(30);   // brief yield so SSL session can settle
+
+        // Radar overlay (RainViewer) – transparent RGBA PNG composited on top
+        String radUrl = String("https://tilecache.rainviewer.com")
+                      + radarPath + "/256/" + z + "/"
+                      + tx[i] + "/" + ty[i] + "/2/0_1.png";
+        int radLen = 0;
+        uint8_t* radBuf = fetchTile(sc, radUrl, radLen);
+        if (radBuf) {
+            decodeIntoCanvas(radBuf, radLen, i, true);
+            heap_caps_free(radBuf);
+        }
+        delay(30);
+
+        lv_obj_invalidate(radarCanvas[i]);   // queue LVGL redraw for this tile
+
+        // 40 / 60 / 80 / 100% as each tile completes
+        radarProgress(40 + i * 20, 0x00AA00u);
+    }
+
+    radarProgress(0, 0);   // erase bar — we're done
+
+    // ---- Step 4: location marker (43°22′30.7″N, 80°56′44.2″W) ----
+    lv_obj_add_flag(radarDot, LV_OBJ_FLAG_HIDDEN);
+    const double LOC_LAT =  43.375194;
+    const double LOC_LON = -80.945611;
+    double lat_r = LOC_LAT * M_PI / 180.0;
+    double n     = pow(2.0, z);
+    double xtile = n * ((LOC_LON + 180.0) / 360.0);
+    double ytile = n * (1.0 - log(tan(lat_r) + 1.0 / cos(lat_r)) / M_PI) / 2.0;
+    for (int i = 0; i < 4; i++) {
+        if ((int)xtile == tx[i] && (int)ytile == ty[i]) {
+            int px = (int)((xtile - (int)xtile) * 256.0);
+            int py = (int)((ytile - (int)ytile) * 256.0);
+            int qx = (i & 1) ? 256 : 0;
+            int qy = (i & 2) ? 256 : 0;
+            lv_obj_set_pos(radarDot, qx + px - 4, qy + py - 4);   // centre the 8×8 dot
+            lv_obj_clear_flag(radarDot, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(radarDot);
+            break;
+        }
+    }
+
+    // ---- Step 5: update info labels ----
+    if (radarTimestamp > 0) {
+        time_t ts = (time_t)radarTimestamp;
+        struct tm* ti = localtime(&ts);
+        char buf[48];
+        strftime(buf, sizeof(buf), "Radar: %b %d, %I:%M %p", ti);
+        lv_label_set_text(objects.label_timestamp, buf);
+    }
+    lv_label_set_text_fmt(objects.label_coords, "X-%d, Y-%d [Z-%d]", x, y, z);
+    Serial.printf("RADAR: refresh done z=%d x=%d y=%d\n", z, x, y);
+}
+
+// =====================================================================
+// RADAR ACTION HANDLERS
+// extern "C" so that the C-compiled screens.c can call them via actions.h.
+// =====================================================================
+
+extern "C" void action_radar_up(lv_event_t* e) {
+    if (radarY > 0) radarY--;
+    radarForceRefresh = true;
+}
+extern "C" void action_radar_down(lv_event_t* e) {
+    int maxTile = (1 << radarZ) - 2;   // -2: bottom tile is radarY+1
+    if (radarY < maxTile) radarY++;
+    radarForceRefresh = true;
+}
+extern "C" void action_radar_left(lv_event_t* e) {
+    if (radarX > 0) radarX--;
+    radarForceRefresh = true;
+}
+extern "C" void action_radar_righ(lv_event_t* e) {
+    int maxTile = (1 << radarZ) - 2;   // -2: right tile is radarX+1
+    if (radarX < maxTile) radarX++;
+    radarForceRefresh = true;
+}
+extern "C" void action_radar_right(lv_event_t* e) {
+    action_radar_righ(e);   // both symbol names are registered in screens.c
+}
+extern "C" void action_radar_in(lv_event_t* e) {
+    if (radarZ >= 10) return;
+    // Preserve the geographic centre of the 2×2 grid across the zoom
+    double n0 = pow(2.0, radarZ);
+    double lon = (radarX + 1.0) / n0 * 360.0 - 180.0;
+    double lr  = atan(sinh(M_PI * (1.0 - 2.0 * (radarY + 1.0) / n0)));
+    double lat = lr * 180.0 / M_PI;
+    radarZ++;
+    double n1 = pow(2.0, radarZ);
+    double lr2 = lat * M_PI / 180.0;
+    radarX = constrain((int)(n1 * ((lon + 180.0) / 360.0)) - 1, 0, (1 << radarZ) - 2);
+    radarY = constrain((int)(n1 * (1.0 - log(tan(lr2) + 1.0/cos(lr2))/M_PI)/2.0) - 1,
+                       0, (1 << radarZ) - 2);
+    radarForceRefresh = true;
+}
+extern "C" void action_radar_out(lv_event_t* e) {
+    if (radarZ <= 1) return;
+    double n0 = pow(2.0, radarZ);
+    double lon = (radarX + 1.0) / n0 * 360.0 - 180.0;
+    double lr  = atan(sinh(M_PI * (1.0 - 2.0 * (radarY + 1.0) / n0)));
+    double lat = lr * 180.0 / M_PI;
+    radarZ--;
+    int maxTile = max(0, (1 << radarZ) - 2);
+    double n1 = pow(2.0, radarZ);
+    double lr2 = lat * M_PI / 180.0;
+    radarX = constrain((int)(n1 * ((lon + 180.0) / 360.0)) - 1, 0, maxTile);
+    radarY = constrain((int)(n1 * (1.0 - log(tan(lr2) + 1.0/cos(lr2))/M_PI)/2.0) - 1,
+                       0, maxTile);
+    radarForceRefresh = true;
+}
+extern "C" void action_radar_indddddddd(lv_event_t* e) { /* auto-generated stub */ }
+
 bool connected = false;
 
 void setup()
@@ -935,22 +1357,7 @@ void setup()
   WiFi.begin(ssid, password);
   WiFi.setTxPower(WIFI_POWER_8_5dBm); //low power for better connectivity
 
-  // Allocate wind history
-  windHistory = (WindDataPoint *)malloc(windHistoryCapacity * sizeof(WindDataPoint));
-  if (windHistory == NULL) {
-    Serial.println("ERROR: Could not allocate wind history!");
-    while(1) delay(1000);
-  }
-  
-  // Allocate wind rose 2D matrix (16 directions × 5 speed bins = 320 bytes)
-  for (int i = 0; i < WIND_DIRECTIONS; i++) {
-    windRoseData[i] = (int *)malloc(WIND_SPEED_BINS * sizeof(int));
-    if (windRoseData[i] == NULL) {
-      Serial.println("ERROR: Could not allocate wind rose matrix!");
-      while(1) delay(1000);
-    }
-    memset(windRoseData[i], 0, WIND_SPEED_BINS * sizeof(int));
-  }
+
   Serial.println("Wind rose 2D matrix initialized (320 bytes total)");
   
   Serial.println("Initializing display...");
@@ -1005,6 +1412,8 @@ void setup()
   ui_init();
   Serial.println("UI initialized");
 
+  initRadarCanvases();
+
   Serial.println("Setup complete - Display and touch ready!");
   // Setup backlight LEDC (dual GPIO mode)
   // Both channels use same frequency and resolution to share LEDC timer
@@ -1058,6 +1467,9 @@ void loop() {
     
     applyMqttPending();   // drain MQTT data from AsyncTCP task → LVGL/windHistory
     updateFade();   // advance any active brightness fade
+
+    // Radar: blocking tile fetch; returns immediately if not due or not on screen
+    if (radarScreenActive) doRadar();
     
     every(1000) {
         updateWindTimestamp();  // update elapsed time label
