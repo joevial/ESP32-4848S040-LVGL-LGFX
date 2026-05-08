@@ -1,6 +1,6 @@
 UPDATE: Now with Weather Radar!
 
-<video src='https://github.com/joevial/ESP32-4848S040-LVGL-LGFX/raw/refs/heads/main/Jdg3aM7.mp4' width=480/></video>
+https://github.com/joevial/ESP32-4848S040-LVGL-LGFX/raw/refs/heads/main/Jdg3aM7.mp4
 
 
 This is a BEAST of a display, appears to be 16 line RGB interface with DMA, which allows for some insane framerates (I got over 200fps on one of my tests).
