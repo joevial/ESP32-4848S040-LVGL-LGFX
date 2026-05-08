@@ -1,6 +1,10 @@
 UPDATE: Now with Weather Radar!
 
-https://i.imgur.com/Jdg3aM7.mp4
+
+
+https://github.com/user-attachments/assets/574053ee-0a98-43f8-b060-b05741b2474b
+
+
 
 
 This is a BEAST of a display, appears to be 16 line RGB interface with DMA, which allows for some insane framerates (I got over 200fps on one of my tests).
